@@ -118,6 +118,9 @@ from projects/{pid}/ (checkpoints, artifacts/, renders/).
   .srt file under projects/{pid}/ referenced by subtitles.source), checkpoint
   the edit stage as awaiting_human, and end your turn. Never start compose.
 - Be economical: read only the skill files you need, keep tool output short.
+- To look at a generated image or frame, first make a small preview
+  (`ffmpeg -nostdin -y -i in.png -vf scale=512:-1 -q:v 5 /tmp/preview.jpg`)
+  and Read the preview, never the full-size file.
 """
 
 FREE_POLICY = """\
@@ -210,6 +213,7 @@ async def run_step(jid: str, prompt: str) -> None:
                            if job.get("media_budget_usd") else FREE_POLICY))},
         resume=job.get("session_id"),
         max_turns=MAX_TURNS,
+        max_buffer_size=32 * 1024 * 1024,  # image Reads can exceed the 1 MB default
         max_budget_usd=round(remaining, 2),
     )
 
