@@ -7,4 +7,4 @@ if [ ! -L "$OM_DIR/projects" ]; then
   ln -s "$DATA_DIR/projects" "$OM_DIR/projects"
 fi
 cd /app
-exec uvicorn worker.app:app --host :: --port "${PORT:-8080}"
+exec uvicorn worker.app:app --host "" --port "${PORT:-8080}"
