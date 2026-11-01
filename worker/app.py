@@ -368,7 +368,7 @@ async def render_free_job(jid: str) -> None:
 # ---------- API ----------
 
 class NewJob(BaseModel):
-    topic: str = Field(min_length=2, max_length=500)
+    topic: str = Field(min_length=2, max_length=1500)
     pipeline: str = "documentary-montage"
     duration_sec: int = Field(default=60, ge=15, le=180)
     language: str = Field(default="ko", max_length=20)
