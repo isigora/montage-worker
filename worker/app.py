@@ -39,7 +39,7 @@ SMOKE_TOPIC = os.environ.get("SMOKE_TOPIC", "").strip()
 RENDER_FREE_JOB = os.environ.get("RENDER_FREE_JOB", "").strip()
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 
-PIPELINES = {"documentary-montage", "animated-explainer"}
+PIPELINES = {"documentary-montage"}  # FFmpeg-renderable without Remotion
 ACTIVE = {"queued", "running"}
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -105,15 +105,15 @@ from projects/{pid}/ (checkpoints, artifacts/, renders/).
   smallest source rendition that is at least 1080p (never 4K/orig masters).
   Right after cutting clips, transcode every clip to H.264 1080p max, 30 fps,
   with `ffmpeg -nostdin`, then delete the raw downloads.
-- Render with Remotion using `--concurrency=2`. If a Remotion render fails or
-  times out twice, the user has PRE-APPROVED an FFmpeg render of the same edit
-  (same cuts, narration, music, subtitles; simple text fades are fine). Log it as
-  a render_runtime_selection decision and continue without asking.
 - Run long commands in the foreground with a timeout instead of background
   jobs plus polling; every polling turn costs money.
-- The final video must be written to projects/{pid}/renders/final.mp4.
-  When it is rendered and has passed your quality checks, end with a one-line
-  Korean message that starts with "완성:".
+- DO NOT RENDER. The worker renders the final video itself with FFmpeg after
+  the user approves the edit stage. Your job ends at the edit stage: write
+  edit_decisions (cuts with real source paths relative to projects/{pid}/,
+  audio.narration.segments with start_seconds, audio.music, and a subtitles
+  .srt file under projects/{pid}/ referenced by subtitles.source), checkpoint
+  the edit stage as awaiting_human, and end your turn. Never start compose.
+- Be economical: read only the skill files you need, keep tool output short.
 """
 
 
@@ -324,6 +324,9 @@ async def render_free_job(jid: str) -> None:
             await asyncio.to_thread(render, project_dir(jid))
         except Exception as e:  # noqa: BLE001
             print(f"[render-free] failed: {e}", flush=True)
+            job = load(jid)
+            job.update(status="failed", message="영상 합치기에 실패했어요.", error=str(e)[:2000])
+            save(job)
             return
     job = load(jid)
     job.setdefault("download_token", secrets.token_urlsafe(24))
@@ -416,6 +419,12 @@ async def _resume(jid: str, prompt: str) -> dict:
 
 @app.post("/jobs/{jid}/approve", dependencies=[Depends(auth)])
 async def approve(jid: str) -> dict:
+    job = load(jid)
+    if job["status"] == "waiting" and job.get("stage") == "edit":
+        job.update(status="running", stage="render", message="영상을 합치는 중이에요. (Claude 비용 없음)")
+        save(job)
+        asyncio.create_task(render_free_job(jid))
+        return public(job)
     return await _resume(jid, "승인합니다. 이 단계를 human_approved=True로 완료 처리하고 다음 단계로 진행해 주세요.")
 
 
