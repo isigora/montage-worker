@@ -117,24 +117,27 @@ def render(proj: Path) -> Path:
         # Audio: narration segments + music bed.
         audio = edit.get("audio") or {}
         inputs, filters, labels = [], [], []
+        n_in = 0
         for seg in (audio.get("narration") or {}).get("segments", []):
             p = resolve(seg.get("asset_id"))
             if not p:
                 _log(f"skip narration {seg.get('asset_id')}")
                 continue
-            k = len(inputs)
+            k = n_in
+            n_in += 1
             inputs += ["-i", str(p)]
             ms = int(float(seg.get("start_seconds", 0)) * 1000)
-            filters.append(f"[{k}:a]aresample=48000,adelay={ms}|{ms}[n{k}]")
+            filters.append(f"[{k}:a]aresample=48000,aformat=channel_layouts=stereo,adelay={ms}|{ms}[n{k}]")
             labels.append(f"[n{k}]")
         music = audio.get("music") or edit.get("music") or {}
         mp = resolve(music.get("asset_id"))
         if mp:
-            k = len(inputs)
+            k = n_in
+            n_in += 1
             inputs += ["-stream_loop", "-1", "-i", str(mp)]
             vol = float(music.get("volume", 0.25))
             fo = float(music.get("fade_out_seconds", 2))
-            filters.append(f"[{k}:a]aresample=48000,volume={vol},atrim=0:{total:.3f},"
+            filters.append(f"[{k}:a]aresample=48000,aformat=channel_layouts=stereo,volume={vol},atrim=0:{total:.3f},"
                            f"afade=t=out:st={max(0, total - fo):.3f}:d={fo:.3f}[m]")
             labels.append("[m]")
         mixed = None
