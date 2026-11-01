@@ -36,6 +36,8 @@ STEP_TIMEOUT = int(os.environ.get("STEP_TIMEOUT_SEC", "5400"))
 
 SMOKE_OWNER = "smoke-test"
 SMOKE_TOPIC = os.environ.get("SMOKE_TOPIC", "").strip()
+RENDER_FREE_JOB = os.environ.get("RENDER_FREE_JOB", "").strip()
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 
 PIPELINES = {"documentary-montage", "animated-explainer"}
 ACTIVE = {"queued", "running"}
@@ -303,6 +305,31 @@ async def _startup() -> None:
         await _queue.put((jid, first_prompt(job)))
         print(f"[smoke] queued job {jid}: {SMOKE_TOPIC}", flush=True)
     asyncio.create_task(runner())
+    if RENDER_FREE_JOB:
+        asyncio.create_task(render_free_job(RENDER_FREE_JOB))
+
+
+async def render_free_job(jid: str) -> None:
+    """Finish a job from its approved edit with FFmpeg only (no Claude cost)."""
+    from worker.render_free import render
+    try:
+        job = load(jid)
+    except HTTPException:
+        print(f"[render-free] job {jid} not found", flush=True)
+        return
+    if final_video(jid):
+        print(f"[render-free] job {jid} already has final.mp4", flush=True)
+    else:
+        try:
+            await asyncio.to_thread(render, project_dir(jid))
+        except Exception as e:  # noqa: BLE001
+            print(f"[render-free] failed: {e}", flush=True)
+            return
+    job = load(jid)
+    job.setdefault("download_token", secrets.token_urlsafe(24))
+    job.update(status="done", stage=None, message="완성됐어요. (FFmpeg 렌더)")
+    save(job)
+    print(f"[render-free] download: {PUBLIC_URL}/dl/{jid}/{job['download_token']}", flush=True)
 
 
 # ---------- API ----------
@@ -416,6 +443,16 @@ async def delete(jid: str) -> dict:
     shutil.rmtree(project_dir(jid), ignore_errors=True)
     _job_path(jid).unlink(missing_ok=True)
     return {"deleted": job["id"]}
+
+
+@app.get("/dl/{jid}/{token}")
+async def download(jid: str, token: str):
+    job = load(jid)
+    want = job.get("download_token")
+    video = final_video(jid)
+    if not want or not secrets.compare_digest(token, want) or not video:
+        raise HTTPException(404, "not found")
+    return FileResponse(video, media_type="video/mp4", filename=f"{jid}.mp4")
 
 
 @app.get("/jobs/{jid}/files/{path:path}", dependencies=[Depends(auth)])
