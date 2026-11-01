@@ -21,7 +21,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, SystemMessage, query
+from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions, ResultMessage, SystemMessage,
+                              TextBlock, ToolUseBlock, query)
 
 OM_DIR = Path(os.environ.get("OM_DIR", "/app/OpenMontage"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -32,6 +33,9 @@ MODEL = os.environ.get("MONTAGE_MODEL", "claude-sonnet-5-5")
 JOB_BUDGET_USD = float(os.environ.get("JOB_BUDGET_USD", "3"))
 MAX_TURNS = int(os.environ.get("MAX_TURNS_PER_STEP", "300"))
 STEP_TIMEOUT = int(os.environ.get("STEP_TIMEOUT_SEC", "5400"))
+
+SMOKE_OWNER = "smoke-test"
+SMOKE_TOPIC = os.environ.get("SMOKE_TOPIC", "").strip()
 
 PIPELINES = {"documentary-montage", "animated-explainer"}
 ACTIVE = {"queued", "running"}
@@ -176,6 +180,13 @@ async def run_step(jid: str, prompt: str) -> None:
                     if sid and not job.get("session_id"):
                         job["session_id"] = sid
                         save(job)
+                elif isinstance(msg, AssistantMessage):
+                    for b in msg.content:
+                        if isinstance(b, ToolUseBlock):
+                            arg = json.dumps(b.input, ensure_ascii=False)[:160]
+                            print(f"[job {jid}] tool {b.name} {arg}", flush=True)
+                        elif isinstance(b, TextBlock) and b.text.strip():
+                            print(f"[job {jid}] says {b.text.strip()[:200]!r}", flush=True)
                 elif isinstance(msg, ResultMessage):
                     result = msg
     except asyncio.CancelledError:
@@ -216,6 +227,20 @@ async def run_step(jid: str, prompt: str) -> None:
         job.update(status="waiting", stage=(gate or {}).get("stage"),
                    gate=gate, message=text[:1500] or "확인이 필요해요.")
     save(job)
+    print(f"[job {jid}] status={job['status']} stage={job.get('stage')} cost=${job.get('cost_usd')} "
+          f"turns={job.get('turns')} msg={job.get('message', '')[:300]!r}", flush=True)
+
+    # Smoke-test mode: approve every gate and answer questions automatically.
+    if job.get("owner") == SMOKE_OWNER and job["status"] == "waiting" and job.get("auto_steps", 0) < 20:
+        job["auto_steps"] = job.get("auto_steps", 0) + 1
+        save(job)
+        if gate:
+            prompt = "승인합니다. 이 단계를 human_approved=True로 완료 처리하고 다음 단계로 진행해 주세요."
+        else:
+            prompt = "사용자 답변: 무료 경로 안에서 가장 무난한 선택으로 알아서 진행해 주세요."
+        job.update(status="queued")
+        save(job)
+        await _queue.put((jid, prompt))
 
 
 async def runner() -> None:
@@ -257,6 +282,16 @@ async def _startup() -> None:
         else:
             job.update(status="waiting", message="서버가 재시작됐어요. '계속'이라고 답하면 이어서 진행해요.")
             save(job)
+    if SMOKE_TOPIC and not any(
+        json.loads(p.read_text()).get("owner") == SMOKE_OWNER for p in JOBS_DIR.glob("*.json")
+    ):
+        jid = uuid.uuid4().hex[:16]
+        job = {"id": jid, "owner": SMOKE_OWNER, "topic": SMOKE_TOPIC, "pipeline": "documentary-montage",
+               "duration_sec": 60, "language": "ko", "status": "queued", "stage": None,
+               "message": "대기 중이에요.", "cost_usd": 0.0, "created_at": time.time()}
+        save(job)
+        await _queue.put((jid, first_prompt(job)))
+        print(f"[smoke] queued job {jid}: {SMOKE_TOPIC}", flush=True)
     asyncio.create_task(runner())
 
 
