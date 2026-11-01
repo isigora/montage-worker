@@ -39,7 +39,13 @@ SMOKE_TOPIC = os.environ.get("SMOKE_TOPIC", "").strip()
 RENDER_FREE_JOB = os.environ.get("RENDER_FREE_JOB", "").strip()
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 
-PIPELINES = {"documentary-montage"}  # FFmpeg-renderable without Remotion
+# Pipelines whose edit can be rendered by worker/render_free.py (plain FFmpeg).
+PIPELINES = {
+    "documentary-montage": {"paid_media": False, "claude_budget": JOB_BUDGET_USD},
+    "cinematic": {"paid_media": True,
+                  "claude_budget": float(os.environ.get("CINEMATIC_CLAUDE_BUDGET_USD", "5"))},
+}
+MAX_MEDIA_BUDGET = float(os.environ.get("MAX_MEDIA_BUDGET_USD", "15"))
 ACTIVE = {"queued", "running"}
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -91,9 +97,7 @@ from projects/{pid}/ (checkpoints, artifacts/, renders/).
 
 - Use the project id `{pid}` exactly. Initialise it with lib.checkpoint.init_project.
 - Pipeline: `{pipeline}`. Do not switch pipelines.
-- FREE PATH ONLY. Do not use any paid provider or API key. Use free/open footage
-  (Archive.org, Wikimedia, NASA, Pexels/Pixabay only if a key is already set),
-  Remotion components, and the local Piper TTS. Never ask the user for API keys.
+{media_policy}
 - Approval gates are binding: when a gated stage is done, write its checkpoint
   as awaiting_human and END YOUR TURN.
 - When you need a decision from the user (gate, runtime choice, blocker), end
@@ -116,6 +120,26 @@ from projects/{pid}/ (checkpoints, artifacts/, renders/).
 - Be economical: read only the skill files you need, keep tool output short.
 """
 
+FREE_POLICY = """\
+- FREE PATH ONLY. Do not use any paid provider or API key. Use free/open footage
+  (Archive.org, Wikimedia, NASA, Pexels/Pixabay only if a key is already set),
+  and the local Piper TTS. Never ask the user for API keys."""
+
+PAID_POLICY = """\
+- MEDIA BUDGET: you may use fal.ai (FAL_KEY is set) for image and video
+  generation, up to ${media:.2f} in total for this project. This is a hard cap:
+  estimate each call's price before running it, keep a running total in the
+  cost snapshot, and stop and ask before anything that would exceed it.
+  No other paid providers. Narration (if any): local Piper TTS. Music: generate
+  a bed locally with ffmpeg or use none. Never ask the user for API keys.
+- Prefer the cheapest fal video model that meets the shot; 5 s clips at 720p or
+  1080p. For transformations or complex motion, generate a start frame and an
+  end frame as images first, then image-to-video between them. Make one
+  character reference image first and reuse it for consistency.
+- Show the proposal's per-item cost estimate in your gate message.
+- No real people, no copyrighted characters, logos or franchise designs: keep
+  every character and vehicle original even if the topic names one."""
+
 
 def first_prompt(job: dict) -> str:
     return (
@@ -126,6 +150,10 @@ def first_prompt(job: dict) -> str:
         f"- 프로젝트 id: {job['id']}\n\n"
         f"<topic>\n{job['topic']}\n</topic>"
     )
+
+
+def job_claude_budget(job: dict) -> float:
+    return PIPELINES.get(job.get("pipeline"), {}).get("claude_budget", JOB_BUDGET_USD)
 
 
 # ---------- inspection ----------
@@ -162,7 +190,7 @@ async def run_step(jid: str, prompt: str) -> None:
     job = load(jid)
     if job["status"] == "cancelled":
         return
-    remaining = JOB_BUDGET_USD - job.get("cost_usd", 0.0)
+    remaining = job_claude_budget(job) - job.get("cost_usd", 0.0)
     if remaining <= 0.05:
         job.update(status="failed", message="제작 비용 상한에 도달해 중단했어요.")
         save(job)
@@ -177,7 +205,9 @@ async def run_step(jid: str, prompt: str) -> None:
         permission_mode="bypassPermissions",
         setting_sources=["project"],
         system_prompt={"type": "preset", "preset": "claude_code",
-                       "append": RULES.format(pid=jid, pipeline=job["pipeline"])},
+                       "append": RULES.format(pid=jid, pipeline=job["pipeline"], media_policy=(
+                           PAID_POLICY.format(media=job.get("media_budget_usd", 0))
+                           if job.get("media_budget_usd") else FREE_POLICY))},
         resume=job.get("session_id"),
         max_turns=MAX_TURNS,
         max_budget_usd=round(remaining, 2),
@@ -343,6 +373,7 @@ class NewJob(BaseModel):
     duration_sec: int = Field(default=60, ge=15, le=180)
     language: str = Field(default="ko", max_length=20)
     owner: str | None = Field(default=None, max_length=100)
+    media_budget_usd: float = Field(default=0, ge=0)
 
 
 class Reply(BaseModel):
@@ -350,7 +381,7 @@ class Reply(BaseModel):
 
 
 def public(job: dict) -> dict:
-    keep = ("id", "owner", "topic", "pipeline", "duration_sec", "language", "status", "stage",
+    keep = ("id", "owner", "topic", "pipeline", "duration_sec", "language", "status", "stage", "media_budget_usd",
             "gate", "message", "cost_usd", "created_at", "updated_at", "error")
     out = {k: job.get(k) for k in keep}
     out["has_video"] = final_video(job["id"]) is not None
@@ -366,10 +397,14 @@ async def health() -> dict:
 async def create_job(req: NewJob) -> dict:
     if req.pipeline not in PIPELINES:
         raise HTTPException(400, f"pipeline must be one of {sorted(PIPELINES)}")
+    media = min(req.media_budget_usd, MAX_MEDIA_BUDGET) if PIPELINES[req.pipeline]["paid_media"] else 0.0
+    if PIPELINES[req.pipeline]["paid_media"] and media <= 0:
+        raise HTTPException(400, "media_budget_usd is required for this pipeline")
     jid = uuid.uuid4().hex[:16]
     job = {"id": jid, "owner": req.owner, "topic": req.topic.strip(), "pipeline": req.pipeline,
            "duration_sec": req.duration_sec, "language": req.language, "status": "queued",
-           "stage": None, "message": "대기 중이에요.", "cost_usd": 0.0, "created_at": time.time()}
+           "stage": None, "message": "대기 중이에요.", "cost_usd": 0.0, "media_budget_usd": media,
+           "created_at": time.time()}
     save(job)
     await _queue.put((jid, first_prompt(job)))
     return public(job)
@@ -409,7 +444,7 @@ async def _resume(jid: str, prompt: str) -> dict:
         raise HTTPException(409, "job is cancelled")
     if not job.get("session_id"):
         raise HTTPException(409, "job has no session yet")
-    if job["status"] == "failed" and job.get("cost_usd", 0) >= JOB_BUDGET_USD - 0.05:
+    if job["status"] == "failed" and job.get("cost_usd", 0) >= job_claude_budget(job) - 0.05:
         raise HTTPException(409, "budget exhausted")
     job.update(status="queued", message="대기 중이에요.")
     save(job)

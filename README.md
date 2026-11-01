@@ -5,7 +5,7 @@ A Claude agent (Claude Agent SDK) drives the OpenMontage pipeline inside this co
 every approval gate and resumes the same agent session when the app approves or replies.
 
 - OpenMontage is cloned at a pinned commit during the Docker build (see `Dockerfile`). No changes are made to it.
-- Free path only: open archives, Remotion, local Piper TTS. No paid media providers.
+- Documentary: free path only (open archives, local Piper TTS). Cinematic: fal.ai generation within a per-job media budget.
 - Internal service: reachable only on the Railway private network, and every API call needs the `X-Worker-Secret` header.
 
 ## Environment
@@ -15,7 +15,10 @@ every approval gate and resumes the same agent session when the app approves or 
 | `ANTHROPIC_API_KEY` | Claude API key for the agent |
 | `WORKER_SECRET` | Shared secret; yt-dub sends it as `X-Worker-Secret` |
 | `MONTAGE_MODEL` | Model for the agent (default `claude-sonnet-5-5`) |
-| `JOB_BUDGET_USD` | Claude spend cap per video (default `3`) |
+| `JOB_BUDGET_USD` | Claude spend cap per documentary video (default `3`) |
+| `CINEMATIC_CLAUDE_BUDGET_USD` | Claude spend cap per cinematic video (default `5`) |
+| `FAL_KEY` | fal.ai key for image/video generation (cinematic only) |
+| `MAX_MEDIA_BUDGET_USD` | Upper bound on a job's media budget (default `15`) |
 | `DATA_DIR` | Persistent volume (default `/data`): jobs, projects, agent sessions |
 
 ## API

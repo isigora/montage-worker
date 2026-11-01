@@ -129,6 +129,18 @@ def render(proj: Path) -> Path:
             ms = int(float(seg.get("start_seconds", 0)) * 1000)
             filters.append(f"[{k}:a]aresample=48000,aformat=channel_layouts=stereo,adelay={ms}|{ms}[n{k}]")
             labels.append(f"[n{k}]")
+        for fx in audio.get("sfx") or []:
+            p = resolve(fx.get("asset_id"))
+            if not p:
+                continue
+            k = n_in
+            n_in += 1
+            inputs += ["-i", str(p)]
+            ms = int(float(fx.get("start_seconds", 0)) * 1000)
+            vol = float(fx.get("volume", 1.0))
+            filters.append(f"[{k}:a]aresample=48000,aformat=channel_layouts=stereo,volume={vol},"
+                           f"adelay={ms}|{ms}[n{k}]")
+            labels.append(f"[n{k}]")
         music = audio.get("music") or edit.get("music") or {}
         mp = resolve(music.get("asset_id"))
         if mp:
