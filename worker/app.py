@@ -41,10 +41,15 @@ PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 
 # Pipelines whose edit can be rendered by worker/render_free.py (plain FFmpeg).
 PIPELINES = {
-    "documentary-montage": {"paid_media": False, "claude_budget": JOB_BUDGET_USD},
-    "cinematic": {"paid_media": True,
+    "documentary-montage": {"paid_media": False, "claude_budget": JOB_BUDGET_USD, "self_render": False},
+    "cinematic": {"paid_media": True, "self_render": False,
                   "claude_budget": float(os.environ.get("CINEMATIC_CLAUDE_BUDGET_USD", "5"))},
+    # 자료(PDF·영상 대본)를 2D 모션그래픽 설명 영상으로. Remotion으로 직접 렌더한다.
+    "animated-explainer": {"paid_media": False, "self_render": True,
+                           "claude_budget": float(os.environ.get("EXPLAINER_CLAUDE_BUDGET_USD", "6"))},
 }
+SOURCES_DIR = DATA_DIR / "sources"
+EXPLAINER_STYLES = {"flat-motion-graphics", "minimalist-diagram", "clean-professional"}
 MAX_MEDIA_BUDGET = float(os.environ.get("MAX_MEDIA_BUDGET_USD", "15"))
 ACTIVE = {"queued", "running"}
 
@@ -111,12 +116,7 @@ from projects/{pid}/ (checkpoints, artifacts/, renders/).
   with `ffmpeg -nostdin`, then delete the raw downloads.
 - Run long commands in the foreground with a timeout instead of background
   jobs plus polling; every polling turn costs money.
-- DO NOT RENDER. The worker renders the final video itself with FFmpeg after
-  the user approves the edit stage. Your job ends at the edit stage: write
-  edit_decisions (cuts with real source paths relative to projects/{pid}/,
-  audio.narration.segments with start_seconds, audio.music, and a subtitles
-  .srt file under projects/{pid}/ referenced by subtitles.source), checkpoint
-  the edit stage as awaiting_human, and end your turn. Never start compose.
+{render_policy}
 - Be economical: read only the skill files you need, keep tool output short.
 - To look at a generated image or frame, first make a small preview
   (`ffmpeg -nostdin -y -i in.png -vf scale=512:-1 -q:v 5 /tmp/preview.jpg`)
@@ -127,6 +127,12 @@ FREE_POLICY = """\
 - FREE PATH ONLY. Do not use any paid provider or API key. Use free/open footage
   (Archive.org, Wikimedia, NASA, Pexels/Pixabay only if a key is already set),
   and the local Piper TTS. Never ask the user for API keys."""
+
+EXPLAINER_MEDIA_POLICY = """\
+- NO PAID MEDIA: no paid image, video or music generation and no stock-footage
+  keys. The only paid API you may use is Google TTS for narration (already
+  configured). Music: a quiet bed generated locally with ffmpeg, or none.
+  Never ask the user for API keys."""
 
 PAID_POLICY = """\
 - MEDIA BUDGET: you may use fal.ai (FAL_KEY is set) for image and video
@@ -144,14 +150,57 @@ PAID_POLICY = """\
   every character and vehicle original even if the topic names one."""
 
 
+FFMPEG_RENDER_POLICY = """\
+- DO NOT RENDER. The worker renders the final video itself with FFmpeg after
+  the user approves the edit stage. Your job ends at the edit stage: write
+  edit_decisions (cuts with real source paths relative to projects/{pid}/,
+  audio.narration.segments with start_seconds, audio.music, and a subtitles
+  .srt file under projects/{pid}/ referenced by subtitles.source), checkpoint
+  the edit stage as awaiting_human, and end your turn. Never start compose."""
+
+EXPLAINER_POLICY = """\
+- SOURCE-BASED EXPLAINER. The user's material is in {source_path}. It is the
+  primary content: explain what it says, accurately, as a 2D motion-graphics
+  explainer (the kind used to explain one problem or idea step by step).
+  Research stage: build research_brief mainly from this source (key claims,
+  numbers, steps, terms, the problem it explains); a few web checks are fine
+  but do not drift to other topics. Do not invent facts or numbers.
+- VISUALS: Remotion only, $0 media. Design every scene from the React scene
+  stack (hero_title, section_title, text_card, stat_card / stat_reveal,
+  callout, comparison, bar/line/pie charts, kpi_grid, progress) plus
+  diagram_gen / code_snippet / math_animate when they fit. No paid image or
+  video generation. Playbook: `{style}`. Aspect ratio: {aspect}
+  ({size}). Word-level captions on, in the narration language.
+- NARRATION: google_tts (GOOGLE_TTS_API_KEY is set) with a Chirp 3 HD voice
+  for the narration language (e.g. ko-KR-Chirp3-HD-Kore or -Charon). If it
+  fails, fall back to piper. Natural spoken style, not a lecture.
+- RENDER YOURSELF at the compose stage with video_compose (Remotion engine)
+  and audio_mixer. The final file must be projects/{pid}/renders/final.mp4
+  (H.264, 30 fps). Verify it with ffprobe, then end your turn with a short
+  Korean message. Skip the publish stage."""
+
+
+def render_policy(job: dict) -> str:
+    if PIPELINES.get(job.get("pipeline"), {}).get("self_render"):
+        vertical = job.get("aspect") == "9:16"
+        return EXPLAINER_POLICY.format(
+            source_path=f"{SOURCES_DIR / (job['id'] + '.md')}" if job.get("has_source") else "the topic text below",
+            style=job.get("style") or "flat-motion-graphics",
+            aspect=job.get("aspect") or "16:9",
+            size="1080x1920" if vertical else "1920x1080", pid=job["id"])
+    return FFMPEG_RENDER_POLICY.format(pid=job["id"])
+
+
 def first_prompt(job: dict) -> str:
     return (
         f"새 영상을 만들어 주세요.\n"
         f"- 파이프라인: {job['pipeline']}\n"
         f"- 길이: 약 {job['duration_sec']}초\n"
         f"- 내레이션/자막 언어: {job['language']}\n"
-        f"- 프로젝트 id: {job['id']}\n\n"
-        f"<topic>\n{job['topic']}\n</topic>"
+        f"- 프로젝트 id: {job['id']}\n"
+        + (f"- 원본 자료: {SOURCES_DIR / (job['id'] + '.md')} (먼저 읽고 이 내용을 설명하는 영상으로 만들어 주세요)\n"
+           if job.get("has_source") else "")
+        + f"\n<topic>\n{job['topic']}\n</topic>"
     )
 
 
@@ -208,9 +257,12 @@ async def run_step(jid: str, prompt: str) -> None:
         permission_mode="bypassPermissions",
         setting_sources=["project"],
         system_prompt={"type": "preset", "preset": "claude_code",
-                       "append": RULES.format(pid=jid, pipeline=job["pipeline"], media_policy=(
-                           PAID_POLICY.format(media=job.get("media_budget_usd", 0))
-                           if job.get("media_budget_usd") else FREE_POLICY))},
+                       "append": RULES.format(pid=jid, pipeline=job["pipeline"], render_policy=render_policy(job),
+                           media_policy=(PAID_POLICY.format(media=job.get("media_budget_usd", 0))
+                                         if job.get("media_budget_usd")
+                                         else EXPLAINER_MEDIA_POLICY
+                                         if PIPELINES.get(job["pipeline"], {}).get("self_render")
+                                         else FREE_POLICY))},
         resume=job.get("session_id"),
         max_turns=MAX_TURNS,
         max_buffer_size=32 * 1024 * 1024,  # image Reads can exceed the 1 MB default
@@ -275,6 +327,18 @@ async def run_step(jid: str, prompt: str) -> None:
     save(job)
     print(f"[job {jid}] status={job['status']} stage={job.get('stage')} cost=${job.get('cost_usd')} "
           f"turns={job.get('turns')} msg={job.get('message', '')[:300]!r}", flush=True)
+
+    # 빠른 진행: 첫 확인(기획안) 뒤의 단계는 자동 승인한다. 질문은 사용자에게 넘긴다.
+    if (job.get("auto_after_first") and job["status"] == "waiting" and gate
+            and job.get("gates_seen", 0) >= 1 and job.get("auto_steps", 0) < 12):
+        job["auto_steps"] = job.get("auto_steps", 0) + 1
+        job.update(status="queued", message=f"'{gate.get('stage')}' 단계를 자동으로 승인하고 계속 만들어요.")
+        save(job)
+        await _queue.put((jid, "승인합니다. 이 단계를 human_approved=True로 완료 처리하고 다음 단계로 진행해 주세요."))
+        return
+    if job["status"] == "waiting" and gate:
+        job["gates_seen"] = job.get("gates_seen", 0) + 1
+        save(job)
 
     # Smoke-test mode: approve every gate and answer questions automatically.
     if job.get("owner") == SMOKE_OWNER and job["status"] == "waiting" and job.get("auto_steps", 0) < 20:
@@ -373,6 +437,10 @@ async def render_free_job(jid: str) -> None:
 
 class NewJob(BaseModel):
     topic: str = Field(min_length=2, max_length=1500)
+    source_text: str | None = Field(default=None, max_length=200_000)
+    style: str | None = Field(default=None, max_length=40)
+    aspect: str | None = Field(default=None, max_length=8)
+    auto_after_first: bool = False
     pipeline: str = "documentary-montage"
     duration_sec: int = Field(default=60, ge=15, le=180)
     language: str = Field(default="ko", max_length=20)
@@ -386,7 +454,8 @@ class Reply(BaseModel):
 
 def public(job: dict) -> dict:
     keep = ("id", "owner", "topic", "pipeline", "duration_sec", "language", "status", "stage", "media_budget_usd",
-            "gate", "message", "cost_usd", "created_at", "updated_at", "error")
+            "gate", "message", "cost_usd", "created_at", "updated_at", "error", "style", "aspect", "has_source",
+            "auto_after_first")
     out = {k: job.get(k) for k in keep}
     out["has_video"] = final_video(job["id"]) is not None
     return out
@@ -408,7 +477,14 @@ async def create_job(req: NewJob) -> dict:
     job = {"id": jid, "owner": req.owner, "topic": req.topic.strip(), "pipeline": req.pipeline,
            "duration_sec": req.duration_sec, "language": req.language, "status": "queued",
            "stage": None, "message": "대기 중이에요.", "cost_usd": 0.0, "media_budget_usd": media,
-           "created_at": time.time()}
+           "created_at": time.time(), "auto_after_first": bool(req.auto_after_first)}
+    if req.pipeline == "animated-explainer":
+        job["style"] = req.style if req.style in EXPLAINER_STYLES else "flat-motion-graphics"
+        job["aspect"] = "9:16" if req.aspect == "9:16" else "16:9"
+    if req.source_text and req.source_text.strip():
+        SOURCES_DIR.mkdir(parents=True, exist_ok=True)
+        (SOURCES_DIR / f"{jid}.md").write_text(req.source_text.strip())
+        job["has_source"] = True
     save(job)
     await _queue.put((jid, first_prompt(job)))
     return public(job)
@@ -459,7 +535,8 @@ async def _resume(jid: str, prompt: str) -> dict:
 @app.post("/jobs/{jid}/approve", dependencies=[Depends(auth)])
 async def approve(jid: str) -> dict:
     job = load(jid)
-    if job["status"] == "waiting" and job.get("stage") == "edit":
+    if (job["status"] == "waiting" and job.get("stage") == "edit"
+            and not PIPELINES.get(job.get("pipeline"), {}).get("self_render")):
         job.update(status="running", stage="render", message="영상을 합치는 중이에요. (Claude 비용 없음)")
         save(job)
         asyncio.create_task(render_free_job(jid))
@@ -489,6 +566,7 @@ async def delete(jid: str) -> dict:
     if jid in _current:
         raise HTTPException(409, "cancel first")
     shutil.rmtree(project_dir(jid), ignore_errors=True)
+    (SOURCES_DIR / f"{jid}.md").unlink(missing_ok=True)
     _job_path(jid).unlink(missing_ok=True)
     return {"deleted": job["id"]}
 
